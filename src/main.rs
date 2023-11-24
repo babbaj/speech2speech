@@ -165,9 +165,8 @@ fn main() {
                         *state.lock().unwrap() = State::Recording(input);
                         thread::spawn(move || {
                             let data = read_stdout_fully(&input_copy);
-                            *state_copy.lock().unwrap() = State::Generating;
-
                             let mp3 = encode_mp3(data.as_slice());
+                            *state_copy.lock().unwrap() = State::Generating;
                             RT.block_on(async {
                                 api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
                             });
@@ -184,5 +183,4 @@ fn main() {
         }
     }
     output.send_signal(libc::SIGTERM).unwrap();
-    println!("Hello, world!");
 }
