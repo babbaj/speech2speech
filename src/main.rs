@@ -8,7 +8,6 @@ use std::{thread};
 use std::io::{Read, Write};
 use std::ops::{DerefMut};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
@@ -25,7 +24,6 @@ use once_cell::sync::{Lazy};
 use tokio::runtime::Runtime;
 
 use reqwest::multipart;
-use serde_json::json;
 use tokio::time::Instant;
 
 struct Interface;
@@ -47,16 +45,10 @@ impl LibinputInterface for Interface {
 }
 
 #[derive(Debug)]
-struct RecordState {
-    proc: Arc<Popen>,
-    thread: JoinHandle<()>
-}
-
-#[derive(Debug)]
 enum State {
     Idle,
-    Recording(RecordState),
-    Generating(JoinHandle<()>),
+    Recording(Arc<Popen>),
+    Generating,
     Playing
 }
 
@@ -84,32 +76,28 @@ fn encode_mp3(pcm: &[u8]) -> Vec<u8> {
     });
 }
 
-async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File) -> Result<(), reqwest::Error> {
+async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state: &Mutex<State>) -> Result<(), reqwest::Error> {
     let client = reqwest::Client::new();
     let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream");
 
     let form = multipart::Form::new()
         .part("audio", multipart::Part::bytes(mp3).file_name("file.mp3"));
+        //.part("model_id", multipart::Part::text("eleven_english_sts_v2"));
 
-    let _body = serde_json::to_string(&json!({
-        "model_id": "eleven_english_sts_v2"
-    })).unwrap();
     let request = client.post(url)
         .header("accept", "audio/mpeg")
         .header("xi-api-key", api_key)
-        //.header("Authorization", std::fs::read_to_string("./auth").unwrap().trim())
+        .header("Authorization", std::fs::read_to_string("./auth").unwrap().trim())
         .multipart(form);
-        //.body(body);
+
     let start = Instant::now();
     let response = request.send().await?;
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
+        *state.lock().unwrap() = State::Playing;
         let mut stream = response.bytes_stream();
-        let mut debug_file = File::create("test.mp3").unwrap();
         while let Some(chunk) = stream.next().await {
-            let slice: &[u8] = &chunk?[..];
-            out.write_all(slice).unwrap();
-            debug_file.write_all(slice).unwrap();
+            out.write_all(&chunk?).unwrap();
         }
     } else {
         let body = response.text().await?;
@@ -164,7 +152,6 @@ fn main() {
                 let key_state = kb_event.key_state();
                 let event_key = Key::new(kb_event.key() as u16);
                 if event_key == Key::KEY_RIGHTSHIFT {
-                    //dbg!(event_key);
                     if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle) {
                         let input = Arc::new(Exec::shell(&rec_cmd)
                             .stdout(Redirection::Pipe)
@@ -175,32 +162,21 @@ fn main() {
                         let state_copy = state.clone();
                         let voice = voice.clone();
                         let key = key.clone();
-                        let mut lock = state.lock().unwrap();
-                        let thread = thread::spawn(move || {
+                        *state.lock().unwrap() = State::Recording(input);
+                        thread::spawn(move || {
                             let data = read_stdout_fully(&input_copy);
-                            let mut state = state_copy.lock().unwrap();
-                            if let State::Recording(rec_state) = std::mem::replace(state.deref_mut(), State::Idle) {
-                                *state = State::Generating(rec_state.thread);
-                            } else {
-                                panic!("expected to be in recording state");
-                            }
-                            *state = State::Playing;
-                            drop(state);
+                            *state_copy.lock().unwrap() = State::Generating;
+
                             let mp3 = encode_mp3(data.as_slice());
                             RT.block_on(async {
-                                api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap()).await.unwrap();
+                                api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
                             });
                             *state_copy.lock().unwrap() = State::Idle;
                         });
-
-                        *lock = State::Recording(RecordState {
-                            proc: input,
-                            thread,
-                        })
                     }
                     if key_state == KeyState::Released {
-                        if let State::Recording(ref mut data) = state.lock().unwrap().deref_mut() {
-                            data.proc.send_signal(libc::SIGTERM).unwrap();
+                        if let State::Recording(proc) = state.lock().unwrap().deref_mut() {
+                            proc.send_signal(libc::SIGTERM).unwrap();
                         }
                     }
                 }
