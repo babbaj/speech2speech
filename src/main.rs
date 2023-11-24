@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::ops::{DerefMut};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use clap::{Arg, arg, Parser};
+use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
 
@@ -21,7 +21,7 @@ use subprocess::{Exec, Popen, Redirection};
 use subprocess::unix::PopenExt;
 
 use futures_util::StreamExt;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::{Lazy};
 use tokio::runtime::Runtime;
 
 use reqwest::multipart;
@@ -59,16 +59,17 @@ enum State {
     Playing
 }
 
-fn audio_commands() -> (OsString, OsString) {
+fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
     (
-        OsString::from("pw-record --target easyeffects_source --rate=48000 --channels=2 -"),
+        // --target easyeffects_source
+        OsString::from(format!("pw-record --target {source} --rate=48000 --channels=2 -")),
         // --target LiveSynthSink
-        OsString::from("pw-cat --rate=48000 --channels=2 -p -")
+        OsString::from(format!("pw-cat --target {sink} --rate=48000 --channels=2 -p -"))
     )
 }
 
 fn encode_mp3(pcm: &[u8]) -> Vec<u8> {
-    let ffmpeg_cmd = OsStr::new("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 - | tee input.mp3");
+    let ffmpeg_cmd = OsStr::new("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -");
     let mut proc = Exec::shell(ffmpeg_cmd)
         .stdin(Redirection::Pipe)
         .stdout(Redirection::Pipe)
@@ -89,7 +90,7 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File) -> Res
     let form = multipart::Form::new()
         .part("audio", multipart::Part::bytes(mp3).file_name("file.mp3"));
 
-    let body = serde_json::to_string(&json!({
+    let _body = serde_json::to_string(&json!({
         "model_id": "eleven_english_sts_v2"
     })).unwrap();
     let request = client.post(url)
@@ -141,7 +142,7 @@ fn main() {
     let sink = matches.get_one::<String>("sink").unwrap();
 
     let state = Arc::new(Mutex::new(State::Idle));
-    let (rec_cmd, cat_cmd) = audio_commands();
+    let (rec_cmd, cat_cmd) = audio_commands(&source, &sink);
     let ffmpeg_convert = OsString::from(format!("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 - | {}", cat_cmd.to_str().unwrap()));
 
     let output = Arc::new(Exec::shell(ffmpeg_convert)
@@ -185,7 +186,7 @@ fn main() {
                             drop(state);
                             let mp3 = encode_mp3(data.as_slice());
                             RT.block_on(async {
-                                api(voice.as_str(), key.as_str(), mp3,output_copy.stdin.as_ref().unwrap()).await.unwrap();
+                                api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap()).await.unwrap();
                             });
                             let mut state = state_copy.lock().unwrap();
                             *state = State::Idle;
