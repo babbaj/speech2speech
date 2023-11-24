@@ -26,6 +26,7 @@ use tokio::runtime::Runtime;
 
 use reqwest::multipart;
 use serde_json::json;
+use tokio::time::Instant;
 
 struct Interface;
 
@@ -96,11 +97,13 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File) -> Res
     let request = client.post(url)
         .header("accept", "audio/mpeg")
         .header("xi-api-key", api_key)
+        //.header("Authorization", std::fs::read_to_string("./auth").unwrap().trim())
         .multipart(form);
         //.body(body);
-
+    let start = Instant::now();
     let response = request.send().await?;
     if response.status().is_success() {
+        println!("api took {}ms", start.elapsed().as_millis());
         let mut stream = response.bytes_stream();
         let mut debug_file = File::create("test.mp3").unwrap();
         while let Some(chunk) = stream.next().await {
@@ -175,7 +178,6 @@ fn main() {
                         let mut lock = state.lock().unwrap();
                         let thread = thread::spawn(move || {
                             let data = read_stdout_fully(&input_copy);
-                            println!("read {} bytes", data.len());
                             let mut state = state_copy.lock().unwrap();
                             if let State::Recording(rec_state) = std::mem::replace(state.deref_mut(), State::Idle) {
                                 *state = State::Generating(rec_state.thread);
@@ -188,8 +190,7 @@ fn main() {
                             RT.block_on(async {
                                 api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap()).await.unwrap();
                             });
-                            let mut state = state_copy.lock().unwrap();
-                            *state = State::Idle;
+                            *state_copy.lock().unwrap() = State::Idle;
                         });
 
                         *lock = State::Recording(RecordState {
