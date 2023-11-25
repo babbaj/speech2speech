@@ -47,9 +47,25 @@ impl LibinputInterface for Interface {
 #[derive(Debug)]
 enum State {
     Idle,
-    Recording(Arc<Popen>),
+    Recording(Arc<InputProcs>),
     Generating,
     Playing
+}
+
+#[derive(Debug)]
+struct InputProcs {
+    rec: Popen,
+    ffmpeg: Popen
+}
+fn mic_input(rec_cmd: &OsStr) -> Arc<InputProcs> {
+    let mut ffmpeg = Exec::shell(OsStr::new("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -"))
+        .stdout(Redirection::Pipe)
+        .stdin(Redirection::Pipe)
+        .popen().unwrap();
+    let rec = Exec::shell(rec_cmd)
+        .stdout(Redirection::File(std::mem::take(&mut ffmpeg.stdin).unwrap()))
+        .popen().unwrap();
+    return Arc::new(InputProcs{ rec, ffmpeg});
 }
 
 fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
@@ -59,21 +75,6 @@ fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
         // --target LiveSynthSink
         OsString::from(format!("pw-cat --target {sink} --rate=48000 --channels=2 -p -"))
     )
-}
-
-fn encode_mp3(pcm: &[u8]) -> Vec<u8> {
-    let ffmpeg_cmd = OsStr::new("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -");
-    let mut proc = Exec::shell(ffmpeg_cmd)
-        .stdin(Redirection::Pipe)
-        .stdout(Redirection::Pipe)
-        .popen().unwrap();
-    let mut stdin = std::mem::take(&mut proc.stdin).unwrap();
-    return thread::scope(|s| {
-        s.spawn(move || {
-            stdin.write_all(pcm).unwrap();
-        });
-        return read_stdout_fully(&proc);
-    });
 }
 
 async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state: &Mutex<State>) -> Result<(), reqwest::Error> {
@@ -118,7 +119,6 @@ static RT: Lazy<Runtime> = Lazy::new(||
         .build().unwrap()
 );
 
-
 fn main() {
     let matches = clap::Command::new("autospeech2speech")
         .arg(Arg::new("voice-id").long("voice-id").value_name("VOICE_ID").help("The elevenlabs voice id").required(true))
@@ -153,10 +153,8 @@ fn main() {
                 let event_key = Key::new(kb_event.key() as u16);
                 if event_key == Key::KEY_RIGHTSHIFT {
                     if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle) {
-                        let input = Arc::new(Exec::shell(&rec_cmd)
-                            .stdout(Redirection::Pipe)
-                            .popen().unwrap()
-                        );
+                        let input = mic_input(&rec_cmd);
+
                         let input_copy = input.clone();
                         let output_copy = output.clone();
                         let state_copy = state.clone();
@@ -164,8 +162,7 @@ fn main() {
                         let key = key.clone();
                         *state.lock().unwrap() = State::Recording(input);
                         thread::spawn(move || {
-                            let data = read_stdout_fully(&input_copy);
-                            let mp3 = encode_mp3(data.as_slice());
+                            let mp3 = read_stdout_fully(&input_copy.ffmpeg);
                             *state_copy.lock().unwrap() = State::Generating;
                             RT.block_on(async {
                                 api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
@@ -175,7 +172,7 @@ fn main() {
                     }
                     if key_state == KeyState::Released {
                         if let State::Recording(proc) = state.lock().unwrap().deref_mut() {
-                            proc.send_signal(libc::SIGTERM).unwrap();
+                            proc.rec.send_signal(libc::SIGTERM).unwrap();
                         }
                     }
                 }
