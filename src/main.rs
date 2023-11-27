@@ -6,7 +6,7 @@ use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
 use std::{thread};
 use std::io::{Read, Write};
-use std::ops::{DerefMut};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
@@ -24,6 +24,7 @@ use once_cell::sync::{Lazy};
 use tokio::runtime::Runtime;
 
 use reqwest::multipart;
+use serde_json::json;
 use tokio::time::Instant;
 
 struct Interface;
@@ -46,7 +47,7 @@ impl LibinputInterface for Interface {
 
 #[derive(Debug)]
 enum State {
-    Idle,
+    Idle(Option<Arc<Vec<u8>>>),
     Recording(Arc<InputProcs>),
     Generating,
     Playing
@@ -77,16 +78,24 @@ fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
     )
 }
 
-async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state: &Mutex<State>) -> Result<(), reqwest::Error> {
+async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
     let client = reqwest::Client::new();
-    let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream");
+    let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream?optimize_streaming_latency=4");
 
+    let settings = serde_json::to_string(&json!({
+        "similarity_boost": 0.5,
+        "stability": 0.75,
+        "style": 0,
+        "use_speaker_boost": false
+    })).unwrap();
     let form = multipart::Form::new()
-        .part("audio", multipart::Part::bytes(mp3).file_name("file.mp3"));
-        //.part("model_id", multipart::Part::text("eleven_english_sts_v2"));
+        .part("audio", multipart::Part::bytes(mp3).file_name("file.mp3"))
+        .part("model_id", multipart::Part::text("eleven_english_sts_v2"))
+        .part("voice_settings", multipart::Part::text(settings));
 
     let request = client.post(url)
-        .header("accept", "audio/mpeg")
+        //.header("accept", "audio/mpeg")
+        .header("accept", "*/*")
         .header("xi-api-key", api_key)
         .header("Authorization", std::fs::read_to_string("./auth").unwrap().trim())
         .multipart(form);
@@ -96,15 +105,18 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state:
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
         *state.lock().unwrap() = State::Playing;
+        let mut copy = Vec::<u8>::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            out.write_all(&chunk?).unwrap();
+            let data = &chunk?[..];
+            out.write_all(data).unwrap();
+            copy.extend_from_slice(data);
         }
+        return Ok(copy);
     } else {
         let body = response.text().await?;
         panic!("API failed {body}");
     }
-    Ok(())
 }
 
 fn read_stdout_fully(proc: &Popen) -> Vec<u8> {
@@ -132,7 +144,7 @@ fn main() {
     let source = matches.get_one::<String>("source").unwrap();
     let sink = matches.get_one::<String>("sink").unwrap();
 
-    let state = Arc::new(Mutex::new(State::Idle));
+    let state = Arc::new(Mutex::new(State::Idle(None)));
     let (rec_cmd, cat_cmd) = audio_commands(&source, &sink);
     let ffmpeg_convert = OsString::from(format!("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 - | {}", cat_cmd.to_str().unwrap()));
 
@@ -151,8 +163,17 @@ fn main() {
             if let Event::Keyboard(kb_event) = event {
                 let key_state = kb_event.key_state();
                 let event_key = Key::new(kb_event.key() as u16);
+                if event_key == Key::KEY_RIGHTCTRL && key_state == KeyState::Pressed {
+                    if let State::Idle(Some(mp3)) = state.lock().unwrap().deref_mut() {
+                        let mp3_copy = mp3.clone();
+                        let output_copy = output.clone();
+                        thread::spawn(move || {
+                            output_copy.stdin.as_ref().unwrap().write_all(mp3_copy.deref()).unwrap();
+                        });
+                    }
+                }
                 if event_key == Key::KEY_RIGHTSHIFT {
-                    if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle) {
+                    if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle(_)) {
                         let input = mic_input(&rec_cmd);
 
                         let input_copy = input.clone();
@@ -164,10 +185,10 @@ fn main() {
                         thread::spawn(move || {
                             let mp3 = read_stdout_fully(&input_copy.ffmpeg);
                             *state_copy.lock().unwrap() = State::Generating;
-                            RT.block_on(async {
-                                api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
+                            let last_copy = RT.block_on(async {
+                                return api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
                             });
-                            *state_copy.lock().unwrap() = State::Idle;
+                            *state_copy.lock().unwrap() = State::Idle(Some(Arc::new(last_copy)));
                         });
                     }
                     if key_state == KeyState::Released {
