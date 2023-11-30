@@ -29,7 +29,7 @@ use tokio::runtime::Runtime;
 use reqwest::multipart;
 use serde_json::json;
 use tokio::time::Instant;
-use crate::audio::pw_thread;
+use audio::*;
 
 struct Interface;
 
@@ -202,10 +202,13 @@ fn main() {
     let state = Arc::new(Mutex::new(State::Idle(None)));
     let (rec_cmd, _) = audio_commands(&source, &sink);
 
+    pipewire::init();
     let (tx, rx) = channel();
     let (pw_sender, pw_receiver) = pipewire::channel::channel();
-
-    let pw_thread = thread::spawn(move || pw_thread(rx, pw_receiver).unwrap());
+    ctrlc::set_handler(move || {
+        pw_sender.send(Terminate).unwrap();
+    }).unwrap();
+    let pw_thread = thread::spawn(move || pw_playback_thread(rx, pw_receiver).unwrap());
     let audio_sender = Arc::new(tx);
 
     let mut input = Libinput::new_with_udev(Interface);

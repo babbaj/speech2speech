@@ -1,4 +1,4 @@
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::{slice};
 use std::cmp::min;
 
@@ -17,6 +17,7 @@ pub const DEFAULT_RATE: u32 = 48000;
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
+#[derive(Debug)]
 pub struct Terminate;
 
 // TODO: get rid of this in next pipwire-rs release
@@ -26,7 +27,7 @@ fn get_requested(buf: &Buffer) -> u64 {
     return unsafe { (**troll).requested };
 }
 
-pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
+pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
     let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
@@ -83,7 +84,7 @@ pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::chan
                                 },
                                 Err(TryRecvError::Empty) => {
                                     // fill with silence
-                                    out_slice_i16[samples_written..].fill(0);
+                                    out_slice_i16[samples_written..requested_samples].fill(0);
                                     break;
                                 },
                                 Err(TryRecvError::Disconnected) => {
@@ -125,8 +126,7 @@ pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::chan
         spa::Direction::Output,
         None,
         pw::stream::StreamFlags::AUTOCONNECT
-            | pw::stream::StreamFlags::MAP_BUFFERS
-            | pw::stream::StreamFlags::RT_PROCESS,
+        | pw::stream::StreamFlags::MAP_BUFFERS,
         &mut params,
     )?;
 
