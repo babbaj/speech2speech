@@ -6,6 +6,7 @@ use pipewire as pw;
 use pw::{properties, spa};
 use spa::pod::Pod;
 use libspa_sys as spa_sys;
+use pipewire::buffer::Buffer;
 
 struct AudioState {
     rx: Receiver<Vec<i16>>,
@@ -17,6 +18,13 @@ pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
 pub struct Terminate;
+
+// TODO: get rid of this in next pipwire-rs release
+fn get_requested(buf: &Buffer) -> u64 {
+    let ptr = buf as *const Buffer;
+    let troll = ptr as *const *const pipewire_sys::pw_buffer;
+    return unsafe { (**troll).requested };
+}
 
 pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
@@ -48,6 +56,7 @@ pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::chan
         .process(|stream, state| match stream.dequeue_buffer() {
             None => println!("No buffer received"),
             Some(mut buffer) => {
+                let mut requested_samples = get_requested(&buffer) as usize * 2;
                 let datas = buffer.datas_mut();
                 let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
                 let data = &mut datas[0];
@@ -55,11 +64,11 @@ pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::chan
                 let mut samples_written = 0;
                 if let Some(out_slice) = data.data() {
                     let out_slice_i16 = unsafe { slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut i16, out_slice.len() / 2)};
-                    while samples_written < out_slice_i16.len() {
+                    while samples_written < requested_samples {
                         if let Some((vec, idx)) = &mut state.prev_buffer {
                             let remaining = &vec[*idx..];
 
-                            let len = min(vec.len() - *idx, out_slice_i16.len() - samples_written);
+                            let len = min(vec.len() - *idx, requested_samples - samples_written);
                             out_slice_i16[samples_written..samples_written + len].copy_from_slice(&remaining[..len]);
                             samples_written += len;
                             *idx += len;
@@ -87,7 +96,7 @@ pub fn pw_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::chan
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = stride as _;
-                let frames = samples_written * 2;
+                let frames = samples_written / 2;
                 *chunk.size_mut() = (stride * frames) as _;
             }
         })
