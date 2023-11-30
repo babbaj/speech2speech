@@ -1,13 +1,16 @@
+mod audio;
+
 use std::ffi::{OsStr, OsString};
 use input::{Event, Libinput, LibinputInterface};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
-use std::{thread};
+use std::{slice, thread};
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender};
 use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
@@ -26,6 +29,7 @@ use tokio::runtime::Runtime;
 use reqwest::multipart;
 use serde_json::json;
 use tokio::time::Instant;
+use crate::audio::pw_thread;
 
 struct Interface;
 
@@ -78,7 +82,28 @@ fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
     )
 }
 
-async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
+fn decode_mp3(mp3: &[u8]) -> Vec<u8> {
+    let ffmpeg_cmd = OsStr::new("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 -");
+    let mut proc = Exec::shell(ffmpeg_cmd)
+        .stdin(Redirection::Pipe)
+        .stdout(Redirection::Pipe)
+        .popen().unwrap();
+    let mut stdin = std::mem::take(&mut proc.stdin).unwrap();
+    return thread::scope(|s| {
+        s.spawn(move || {
+            stdin.write_all(mp3).unwrap();
+        });
+        return read_stdout_fully(&proc);
+    });
+}
+
+fn u8_to_i16(mut vec: Vec<u8>) -> Vec<i16> {
+    let cast = unsafe { Vec::from_raw_parts(vec.as_mut_ptr() as *mut i16, vec.len() / 2, vec.capacity() / 2) };
+    std::mem::forget(vec);
+    return cast;
+}
+
+async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
     let client = reqwest::Client::new();
     let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream?optimize_streaming_latency=4");
 
@@ -105,13 +130,43 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, mut out: &File, state:
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
         *state.lock().unwrap() = State::Playing;
+        let mut convert_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 -")
+            .stdin(Redirection::Pipe)
+            .stdout(Redirection::Pipe)
+            .popen().unwrap();
+
+        let mut stdout = std::mem::take(&mut convert_proc.stdout).unwrap();
+        let out_copy = out.clone();
+        let mut debug = File::create("reee").unwrap();
+
+        let reader_thread = thread::spawn(move || {
+            loop {
+                let mut vec = Vec::with_capacity(1024);
+                let slice = unsafe { slice::from_raw_parts_mut(vec.as_mut_ptr(), vec.capacity()) };
+                match stdout.read(slice) {
+                    Ok(n) => {
+                        if n <= 0 {
+                            return;
+                        }
+                        unsafe { vec.set_len(n) };
+                        debug.write_all(vec.as_slice()).unwrap();
+                        out_copy.send(u8_to_i16(vec)).unwrap();
+                    },
+                    Err(e) => panic!("{}", e)
+                }
+            }
+        });
+
         let mut copy = Vec::<u8>::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let data = &chunk?[..];
-            out.write_all(data).unwrap();
+            let mut stdin = convert_proc.stdin.as_ref().unwrap();
+            stdin.write_all(data).unwrap();
             copy.extend_from_slice(data);
         }
+        std::mem::take(&mut convert_proc.stdin);
+        reader_thread.join().unwrap();
         return Ok(copy);
     } else {
         let body = response.text().await?;
@@ -145,13 +200,13 @@ fn main() {
     let sink = matches.get_one::<String>("sink").unwrap();
 
     let state = Arc::new(Mutex::new(State::Idle(None)));
-    let (rec_cmd, cat_cmd) = audio_commands(&source, &sink);
-    let ffmpeg_convert = OsString::from(format!("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 - | {}", cat_cmd.to_str().unwrap()));
+    let (rec_cmd, _) = audio_commands(&source, &sink);
 
-    let output = Arc::new(Exec::shell(ffmpeg_convert)
-        .stdin(Redirection::Pipe)
-        .popen().unwrap()
-    );
+    let (tx, rx) = channel();
+    let (pw_sender, pw_receiver) = pipewire::channel::channel();
+
+    let pw_thread = thread::spawn(move || pw_thread(rx, pw_receiver).unwrap());
+    let audio_sender = Arc::new(tx);
 
     let mut input = Libinput::new_with_udev(Interface);
     input.udev_assign_seat("seat0").unwrap();
@@ -166,9 +221,10 @@ fn main() {
                 if event_key == Key::KEY_RIGHTCTRL && key_state == KeyState::Pressed {
                     if let State::Idle(Some(mp3)) = state.lock().unwrap().deref_mut() {
                         let mp3_copy = mp3.clone();
-                        let output_copy = output.clone();
+                        let output_copy = audio_sender.clone();
                         thread::spawn(move || {
-                            output_copy.stdin.as_ref().unwrap().write_all(mp3_copy.deref()).unwrap();
+                            let decoded = u8_to_i16(decode_mp3(mp3_copy.deref()));
+                            output_copy.send(decoded).unwrap();
                         });
                     }
                 }
@@ -177,7 +233,7 @@ fn main() {
                         let input = mic_input(&rec_cmd);
 
                         let input_copy = input.clone();
-                        let output_copy = output.clone();
+                        let output_copy = audio_sender.clone();
                         let state_copy = state.clone();
                         let voice = voice.clone();
                         let key = key.clone();
@@ -186,7 +242,7 @@ fn main() {
                             let mp3 = read_stdout_fully(&input_copy.ffmpeg);
                             *state_copy.lock().unwrap() = State::Generating;
                             let last_copy = RT.block_on(async {
-                                return api(&voice, &key, mp3,output_copy.stdin.as_ref().unwrap(), &state_copy).await.unwrap();
+                                return api(&voice, &key, mp3,output_copy.deref(), &state_copy).await.unwrap();
                             });
                             *state_copy.lock().unwrap() = State::Idle(Some(Arc::new(last_copy)));
                         });
@@ -200,5 +256,5 @@ fn main() {
             }
         }
     }
-    output.send_signal(libc::SIGTERM).unwrap();
+    // todo stop pipewire on SIGINT and SIGTERM
 }
