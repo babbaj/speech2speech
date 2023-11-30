@@ -1,6 +1,6 @@
 mod audio;
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{OsStr};
 use input::{Event, Libinput, LibinputInterface};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -20,7 +20,6 @@ use evdev::Key;
 extern crate libc;
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 use subprocess::{Exec, Popen, Redirection};
-use subprocess::unix::PopenExt;
 
 use futures_util::StreamExt;
 use once_cell::sync::{Lazy};
@@ -49,37 +48,11 @@ impl LibinputInterface for Interface {
     }
 }
 
-#[derive(Debug)]
 enum State {
     Idle(Option<Arc<Vec<u8>>>),
-    Recording(Arc<InputProcs>),
+    Recording(pipewire::channel::Sender<Terminate>),
     Generating,
     Playing
-}
-
-#[derive(Debug)]
-struct InputProcs {
-    rec: Popen,
-    ffmpeg: Popen
-}
-fn mic_input(rec_cmd: &OsStr) -> Arc<InputProcs> {
-    let mut ffmpeg = Exec::shell(OsStr::new("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -"))
-        .stdout(Redirection::Pipe)
-        .stdin(Redirection::Pipe)
-        .popen().unwrap();
-    let rec = Exec::shell(rec_cmd)
-        .stdout(Redirection::File(std::mem::take(&mut ffmpeg.stdin).unwrap()))
-        .popen().unwrap();
-    return Arc::new(InputProcs{ rec, ffmpeg});
-}
-
-fn audio_commands(source: &str, sink: &str) -> (OsString, OsString) {
-    (
-        // --target easyeffects_source
-        OsString::from(format!("pw-record --target {source} --rate=48000 --channels=2 -")),
-        // --target LiveSynthSink
-        OsString::from(format!("pw-cat --target {sink} --rate=48000 --channels=2 -p -"))
-    )
 }
 
 fn decode_mp3(mp3: &[u8]) -> Vec<u8> {
@@ -200,7 +173,6 @@ fn main() {
     let sink = matches.get_one::<String>("sink").unwrap();
 
     let state = Arc::new(Mutex::new(State::Idle(None)));
-    let (rec_cmd, _) = audio_commands(&source, &sink);
 
     pipewire::init();
     let (tx, rx) = channel();
@@ -208,7 +180,7 @@ fn main() {
     ctrlc::set_handler(move || {
         pw_sender.send(Terminate).unwrap();
     }).unwrap();
-    let pw_thread = thread::spawn(move || pw_playback_thread(rx, pw_receiver).unwrap());
+    let _pw_thread = thread::spawn(move || pw_playback_thread(rx, pw_receiver).unwrap());
     let audio_sender = Arc::new(tx);
 
     let mut input = Libinput::new_with_udev(Interface);
@@ -233,16 +205,28 @@ fn main() {
                 }
                 if event_key == Key::KEY_RIGHTSHIFT {
                     if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle(_)) {
-                        let input = mic_input(&rec_cmd);
+                        let (mic_send, mic_receive) = channel();
+                        let (pw_sender, pw_receiver) = pipewire::channel::channel();
+                        thread::spawn(move || pw_mic_thread(mic_send, pw_receiver));
 
-                        let input_copy = input.clone();
                         let output_copy = audio_sender.clone();
                         let state_copy = state.clone();
                         let voice = voice.clone();
                         let key = key.clone();
-                        *state.lock().unwrap() = State::Recording(input);
+                        *state.lock().unwrap() = State::Recording(pw_sender);
                         thread::spawn(move || {
-                            let mp3 = read_stdout_fully(&input_copy.ffmpeg);
+                            let mut encode_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 1 -i - -f mp3 -")
+                                .stdin(Redirection::Pipe)
+                                .stdout(Redirection::Pipe)
+                                .popen().unwrap();
+                            let mut stdin = std::mem::take(&mut encode_proc.stdin).unwrap();
+                            thread::spawn(move || {
+                                for pcm in mic_receive.iter() {
+                                    stdin.write_all(unsafe { slice::from_raw_parts(pcm.as_ptr() as *const u8, pcm.len() * 2) }).unwrap();
+                                }
+                            });
+
+                            let mp3 = read_stdout_fully(&encode_proc);
                             *state_copy.lock().unwrap() = State::Generating;
                             let last_copy = RT.block_on(async {
                                 return api(&voice, &key, mp3,output_copy.deref(), &state_copy).await.unwrap();
@@ -251,13 +235,12 @@ fn main() {
                         });
                     }
                     if key_state == KeyState::Released {
-                        if let State::Recording(proc) = state.lock().unwrap().deref_mut() {
-                            proc.rec.send_signal(libc::SIGTERM).unwrap();
+                        if let State::Recording(sender) = state.lock().unwrap().deref_mut() {
+                            let _ = sender.send(Terminate);
                         }
                     }
                 }
             }
         }
     }
-    // todo stop pipewire on SIGINT and SIGTERM
 }

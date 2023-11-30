@@ -1,5 +1,5 @@
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::{slice};
+use std::{mem, slice};
 use std::cmp::min;
 
 use pipewire as pw;
@@ -7,6 +7,8 @@ use pw::{properties, spa};
 use spa::pod::Pod;
 use libspa_sys as spa_sys;
 use pipewire::buffer::Buffer;
+use pipewire::spa::format::{MediaSubtype, MediaType};
+use pipewire::spa::param::format_utils;
 
 struct AudioState {
     rx: Receiver<Vec<i16>>,
@@ -57,7 +59,7 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
         .process(|stream, state| match stream.dequeue_buffer() {
             None => println!("No buffer received"),
             Some(mut buffer) => {
-                let mut requested_samples = get_requested(&buffer) as usize * 2;
+                let requested_samples = get_requested(&buffer) as usize * 2;
                 let datas = buffer.datas_mut();
                 let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
                 let data = &mut datas[0];
@@ -109,13 +111,13 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
     audio_info.set_channels(DEFAULT_CHANNELS);
 
     let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
-            type_: spa_sys::SPA_TYPE_OBJECT_Format,
-            id: spa_sys::SPA_PARAM_EnumFormat,
-            properties: audio_info.into(),
-        }),
-    )
+            std::io::Cursor::new(Vec::new()),
+            &pw::spa::pod::Value::Object(spa::pod::Object {
+                type_: spa_sys::SPA_TYPE_OBJECT_Format,
+                id: spa_sys::SPA_PARAM_EnumFormat,
+                properties: audio_info.into(),
+            }),
+        )
         .unwrap()
         .0
         .into_inner();
@@ -133,4 +135,131 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
     mainloop.run();
 
     return Ok(());
+}
+
+pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) {
+    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
+    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let core = context
+        .connect(None)
+        .expect("Failed to connect to PipeWire Core");
+
+    let _receiver = pw_receiver.attach(&mainloop, {
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+
+    let props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Music",
+        //*pw::keys::TARGET_OBJECT => "test"
+    };
+
+    let stream = pw::stream::Stream::new(&core, "audio-capture", props).unwrap();
+
+    struct UserData {
+        format: spa::param::audio::AudioInfoRaw,
+        sender: Sender<Vec<i16>>
+    }
+    let data = UserData {
+        format: Default::default(),
+        sender: audio_sender
+    };
+
+
+    let _listener = stream
+        .add_local_listener_with_user_data(data)
+        .param_changed(|_, id, user_data, param| {
+            // NULL means to clear the format
+            let Some(param) = param else {
+                return;
+            };
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+
+            let (media_type, media_subtype) = match format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            // only accept raw audio
+            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+
+            // call a helper function to parse the format for us.
+            user_data
+                .format
+                .parse(param)
+                .expect("Failed to parse param changed to AudioInfoRaw");
+
+            println!(
+                "capturing rate:{} channels:{}",
+                user_data.format.rate(),
+                user_data.format.channels()
+            );
+        })
+        .process(|stream, user_data| match stream.dequeue_buffer() {
+            None => println!("out of buffers"),
+            Some(mut buffer) => {
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+
+                let data = &mut datas[0];
+                let n_channels = user_data.format.channels();
+                let n_samples = data.chunk().size() as usize / (mem::size_of::<i16>());
+
+                if let Some(samples_buf) = data.data() {
+                    let samples = unsafe { slice::from_raw_parts(samples_buf.as_ptr() as *const i16, n_samples)};
+                    let mut out = Vec::<i16>::with_capacity(n_samples);
+                    unsafe { out.set_len(out.capacity()) };
+
+                    if n_channels == 1 {
+                        out.as_mut_slice().copy_from_slice(samples);
+                    } else {
+                        for (out_idx, idx) in (0..n_samples).step_by(n_channels as usize).enumerate() {
+                            out[out_idx] = samples[idx];
+                        }
+                    }
+
+                    user_data.sender.send(out).unwrap();
+                }
+            }
+        })
+        .register().unwrap();
+
+    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
+    audio_info.set_channels(1); // mono
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &spa::pod::Value::Object(obj),
+        )
+        .unwrap()
+        .0
+        .into_inner();
+
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+
+    /* Now connect this stream. We ask that our process function is
+     * called in a realtime thread. */
+    stream.connect(
+        spa::Direction::Input,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+        | pw::stream::StreamFlags::MAP_BUFFERS,
+        &mut params,
+    ).unwrap();
+
+    // and wait while we let things run
+    mainloop.run();
 }
