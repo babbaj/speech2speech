@@ -211,40 +211,34 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>
         thread::spawn(move || unsafe {
             let mut mp3dec = std::mem::zeroed();
             mp3dec_init(&mut mp3dec);
-            let mut debug = std::fs::File::create("reee.mp3").unwrap();
+            //let mut debug = std::fs::File::create("reee").unwrap();
             let mut offset = 0usize;
             for finished in decode_rx.iter() {
                 let mut buf = buffer_copy.lock().unwrap();
 
                 let mut pcm = [0i16; MINIMP3_MAX_SAMPLES_PER_FRAME as usize];
-                if buf.len() - offset >= 4096 || finished {
-                    loop {
-                        let slice = &mut buf[offset..];
-                        let mut info: mp3dec_frame_info_t = std::mem::zeroed();
-                        let samples = mp3dec_decode_frame(&mut mp3dec, slice.as_ptr(), slice.len() as _, pcm.as_mut_ptr(), &mut info);
+                while buf.len() - offset >= (MINIMP3_MAX_SAMPLES_PER_FRAME * 8) as usize || finished {
+                    let slice = &buf[offset..];
+                    let mut info: mp3dec_frame_info_t = std::mem::zeroed();
+                    let samples = mp3dec_decode_frame(&mut mp3dec, slice.as_ptr(), slice.len() as _, pcm.as_mut_ptr(), &mut info);
 
-                        if samples > 0 {
-                            let stereo = if info.channels == 1 {
-                                mono_to_stereo(&pcm[..samples as usize])
-                            } else if info.channels == 2 {
-                                pcm[..samples as usize].to_vec()
-                            } else {
-                                panic!("too many channels");
-                            };
-                            //debug.write_all(slice::from_raw_parts(stereo.as_ptr() as *const _, stereo.len() * 2)).unwrap();
-                            //debug.write_all(slice::from_raw_parts(stereo.as_ptr() as *const _, stereo.len() * 2)).unwrap();
-                            out_copy.send(stereo).unwrap();
-                        }
-                        debug.write_all(&slice[..info.frame_bytes as usize]).unwrap();
-                        if info.frame_bytes == 0 {
-                            println!("0 frame_bytes {samples} samples");
-                            break;
-                        }
-                        offset += info.frame_bytes as usize;
+                    if samples > 0 {
+                        let stereo = if info.channels == 1 {
+                            mono_to_stereo(&pcm[..samples as usize])
+                        } else if info.channels == 2 {
+                            pcm[..(samples * 2) as usize].to_vec()
+                        } else {
+                            panic!("too many channels");
+                        };
+                        //debug.write_all(slice::from_raw_parts(stereo.as_ptr() as *const _, stereo.len() * 2)).unwrap();
+                        out_copy.send(stereo).unwrap();
                     }
+                    if finished && offset >= buf.len() {
+                        break
+                    }
+                    offset += info.frame_bytes as usize;
                 }
             }
-            println!("{offset}");
         });
 
         let mut copy = Vec::<u8>::new();
