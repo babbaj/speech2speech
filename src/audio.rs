@@ -211,6 +211,7 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
 
                 let data = &mut datas[0];
                 let n_channels = user_data.format.channels();
+                assert_eq!(n_channels, 2);
                 let n_samples = data.chunk().size() as usize / (mem::size_of::<i16>());
 
                 if let Some(samples_buf) = data.data() {
@@ -218,13 +219,14 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
                     let mut out = Vec::<i16>::with_capacity(n_samples);
                     unsafe { out.set_len(out.capacity()) };
 
-                    if n_channels == 1 {
+                    out.as_mut_slice().copy_from_slice(samples);
+                    /*if n_channels == 1 {
                         out.as_mut_slice().copy_from_slice(samples);
                     } else {
                         for (out_idx, idx) in (0..n_samples).step_by(n_channels as usize).enumerate() {
                             out[out_idx] = samples[idx];
                         }
-                    }
+                    }*/
 
                     user_data.sender.send(out).unwrap();
                 }
@@ -234,7 +236,7 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
 
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_channels(1); // mono
+    audio_info.set_channels(2); // 2 is the default but i want to guarantee it
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -250,8 +252,6 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
 
     let mut params = [Pod::from_bytes(&values).unwrap()];
 
-    /* Now connect this stream. We ask that our process function is
-     * called in a realtime thread. */
     stream.connect(
         spa::Direction::Input,
         None,
@@ -260,6 +260,5 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
         &mut params,
     ).unwrap();
 
-    // and wait while we let things run
     mainloop.run();
 }

@@ -215,7 +215,7 @@ fn main() {
                         let key = key.clone();
                         *state.lock().unwrap() = State::Recording(pw_sender);
                         thread::spawn(move || {
-                            let mut encode_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 1 -i - -f mp3 -")
+                            let mut encode_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -")
                                 .stdin(Redirection::Pipe)
                                 .stdout(Redirection::Pipe)
                                 .popen().unwrap();
