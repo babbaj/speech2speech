@@ -15,8 +15,8 @@ struct AudioState {
     prev_buffer: Option<(Vec<i16>, usize)>
 }
 
-pub const DEFAULT_RATE: u32 = 44100;
-pub const DEFAULT_CHANNELS: u32 = 2;
+pub const SAMPLE_RATE: u32 = 44100;
+pub const CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
 #[derive(Debug)]
@@ -29,7 +29,7 @@ fn get_requested(buf: &Buffer) -> u64 {
     return unsafe { (**troll).requested };
 }
 
-pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
+pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
     let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
@@ -46,8 +46,9 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
         "Speech2Speech",
         properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_ROLE => "Music",
+            *pw::keys::MEDIA_ROLE => "Game",
             *pw::keys::MEDIA_CATEGORY => "Playback",
+            *pw::keys::TARGET_OBJECT => target
         },
     )?;
     let state = AudioState {
@@ -59,9 +60,9 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
         .process(|stream, state| match stream.dequeue_buffer() {
             None => println!("No buffer received"),
             Some(mut buffer) => {
-                let requested_samples = get_requested(&buffer) as usize * 2;
+                let requested_samples = (get_requested(&buffer) * CHANNELS as u64) as usize;
                 let datas = buffer.datas_mut();
-                let stride = CHAN_SIZE * DEFAULT_CHANNELS as usize;
+                let stride = CHAN_SIZE * CHANNELS as usize;
                 let data = &mut datas[0];
 
                 let mut samples_written = 0;
@@ -99,7 +100,7 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = stride as _;
-                let frames = samples_written / 2;
+                let frames = samples_written / CHANNELS as usize;
                 *chunk.size_mut() = (stride * frames) as _;
             }
         })
@@ -107,8 +108,8 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
 
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_rate(44100);
-    audio_info.set_channels(2);
+    audio_info.set_rate(SAMPLE_RATE);
+    audio_info.set_channels(CHANNELS);
 
     let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),
@@ -137,7 +138,7 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
     return Ok(());
 }
 
-pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) {
+pub fn pw_mic_thread(target: &str, audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::channel::Receiver<Terminate>) {
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
     let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
@@ -152,8 +153,8 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
     let props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "Music",
-        //*pw::keys::TARGET_OBJECT => "test"
+        *pw::keys::MEDIA_ROLE => "Game",
+        *pw::keys::TARGET_OBJECT => target
     };
 
     let stream = pw::stream::Stream::new(&core, "audio-capture", props).unwrap();
@@ -211,23 +212,14 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
 
                 let data = &mut datas[0];
                 let n_channels = user_data.format.channels();
-                assert_eq!(n_channels, 2);
+                assert_eq!(n_channels, CHANNELS);
                 let n_samples = data.chunk().size() as usize / (mem::size_of::<i16>());
 
                 if let Some(samples_buf) = data.data() {
                     let samples = unsafe { slice::from_raw_parts(samples_buf.as_ptr() as *const i16, n_samples)};
                     let mut out = Vec::<i16>::with_capacity(n_samples);
                     unsafe { out.set_len(out.capacity()) };
-
                     out.as_mut_slice().copy_from_slice(samples);
-                    /*if n_channels == 1 {
-                        out.as_mut_slice().copy_from_slice(samples);
-                    } else {
-                        for (out_idx, idx) in (0..n_samples).step_by(n_channels as usize).enumerate() {
-                            out[out_idx] = samples[idx];
-                        }
-                    }*/
-
                     user_data.sender.send(out).unwrap();
                 }
             }
@@ -236,7 +228,8 @@ pub fn pw_mic_thread(audio_sender: Sender<Vec<i16>>, pw_receiver: pipewire::chan
 
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_channels(2); // 2 is the default but i want to guarantee it
+    audio_info.set_channels(CHANNELS); // 2 is the default but i want to guarantee it
+    audio_info.set_rate(SAMPLE_RATE);
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
