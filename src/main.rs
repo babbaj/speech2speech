@@ -23,7 +23,7 @@ extern crate libc;
 use libc::{c_char, c_short, O_RDONLY, O_RDWR, O_WRONLY};
 use subprocess::{Exec, Popen, Redirection};
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use once_cell::sync::{Lazy};
 use tokio::runtime::Runtime;
 
@@ -32,6 +32,7 @@ use serde_json::json;
 
 //use rusty_ffmpeg::ffi;
 use lame_sys::*;
+use minimp3_sys::*;
 
 use audio::*;
 
@@ -165,6 +166,16 @@ fn encode_mp3(pcm: &mut [i16]) -> Vec<u8> {
     }
 }
 
+fn mono_to_stereo(pcm: &[i16]) -> Vec<i16> {
+    let mut out = Vec::<i16>::with_capacity(pcm.len() * 2);
+    unsafe { out.set_len(out.capacity()) };
+    for (i, s) in pcm.iter().enumerate() {
+        out[i * 2] = *s;
+        out[i * 2 + 1] = *s;
+    }
+    return out;
+}
+
 async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
     let client = reqwest::Client::new();
     let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream?optimize_streaming_latency=4");
@@ -192,53 +203,59 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
         *state.lock().unwrap() = State::Playing;
-        /*let ctx;
-        unsafe {
-            ctx = lame_init();
-            lame_set_in_samplerate(ctx, 48000);
-            lame_set_out_samplerate(ctx, 48000);
-            lame_set_decode_only(ctx, 1);
-            if lame_init_params(ctx) < 0 {
-                panic!("Failed to init LAME parameters");
-            }
-        }*/
-        let mut convert_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 -")
-            .stdin(Redirection::Pipe)
-            .stdout(Redirection::Pipe)
-            .popen().unwrap();
 
-        let mut stdout = std::mem::take(&mut convert_proc.stdout).unwrap();
         let out_copy = out.clone();
-        let mut debug = File::create("reee").unwrap();
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let (decode_tx, decode_rx) = channel();
+        let buffer_copy = buffer.clone();
+        thread::spawn(move || unsafe {
+            let mut mp3dec = std::mem::zeroed();
+            mp3dec_init(&mut mp3dec);
+            let mut debug = std::fs::File::create("reee.mp3").unwrap();
+            let mut offset = 0usize;
+            for finished in decode_rx.iter() {
+                let mut buf = buffer_copy.lock().unwrap();
 
-        let reader_thread = thread::spawn(move || {
-            loop {
-                let mut vec = Vec::with_capacity(1024);
-                let slice = unsafe { slice::from_raw_parts_mut(vec.as_mut_ptr(), vec.capacity()) };
-                match stdout.read(slice) {
-                    Ok(n) => {
-                        if n <= 0 {
-                            return;
+                let mut pcm = [0i16; MINIMP3_MAX_SAMPLES_PER_FRAME as usize];
+                if buf.len() - offset >= 4096 || finished {
+                    loop {
+                        let slice = &mut buf[offset..];
+                        let mut info: mp3dec_frame_info_t = std::mem::zeroed();
+                        let samples = mp3dec_decode_frame(&mut mp3dec, slice.as_ptr(), slice.len() as _, pcm.as_mut_ptr(), &mut info);
+
+                        if samples > 0 {
+                            let stereo = if info.channels == 1 {
+                                mono_to_stereo(&pcm[..samples as usize])
+                            } else if info.channels == 2 {
+                                pcm[..samples as usize].to_vec()
+                            } else {
+                                panic!("too many channels");
+                            };
+                            //debug.write_all(slice::from_raw_parts(stereo.as_ptr() as *const _, stereo.len() * 2)).unwrap();
+                            //debug.write_all(slice::from_raw_parts(stereo.as_ptr() as *const _, stereo.len() * 2)).unwrap();
+                            out_copy.send(stereo).unwrap();
                         }
-                        unsafe { vec.set_len(n) };
-                        debug.write_all(vec.as_slice()).unwrap();
-                        out_copy.send(u8_to_i16(vec)).unwrap();
-                    },
-                    Err(e) => panic!("{}", e)
+                        debug.write_all(&slice[..info.frame_bytes as usize]).unwrap();
+                        if info.frame_bytes == 0 {
+                            println!("0 frame_bytes {samples} samples");
+                            break;
+                        }
+                        offset += info.frame_bytes as usize;
+                    }
                 }
             }
+            println!("{offset}");
         });
 
         let mut copy = Vec::<u8>::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let data = &chunk?[..];
-            let mut stdin = convert_proc.stdin.as_ref().unwrap();
-            stdin.write_all(data).unwrap();
+            buffer.lock().unwrap().extend_from_slice(data);
+            decode_tx.send(false).unwrap();
             copy.extend_from_slice(data);
         }
-        std::mem::take(&mut convert_proc.stdin);
-        reader_thread.join().unwrap();
+        decode_tx.send(true).unwrap();
         return Ok(copy);
     } else {
         let body = response.text().await?;

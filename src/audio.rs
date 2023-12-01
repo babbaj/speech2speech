@@ -15,7 +15,7 @@ struct AudioState {
     prev_buffer: Option<(Vec<i16>, usize)>
 }
 
-pub const DEFAULT_RATE: u32 = 48000;
+pub const DEFAULT_RATE: u32 = 44100;
 pub const DEFAULT_CHANNELS: u32 = 2;
 pub const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
@@ -107,8 +107,8 @@ pub fn pw_playback_thread(audio_receiver: Receiver<Vec<i16>>, pw_receiver: pipew
 
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_rate(DEFAULT_RATE);
-    audio_info.set_channels(DEFAULT_CHANNELS);
+    audio_info.set_rate(44100);
+    audio_info.set_channels(2);
 
     let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),

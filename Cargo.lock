@@ -92,6 +92,7 @@ dependencies = [
  "lame-sys",
  "libc",
  "libspa-sys",
+ "minimp3-sys",
  "nix 0.27.1",
  "once_cell",
  "pipewire",
@@ -775,6 +776,15 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minimp3-sys"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e21c73734c69dc95696c9ed8926a2b393171d98b3f5f5935686a26a487ab9b90"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "miniz_oxide"
