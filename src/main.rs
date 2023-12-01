@@ -1,16 +1,18 @@
 mod audio;
 
-use std::ffi::{OsStr};
+use std::ffi::{c_int, c_uchar, OsStr};
 use input::{Event, Libinput, LibinputInterface};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
 use std::{slice, thread};
+use std::cmp::min;
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender};
+use std::time::Instant;
 use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
@@ -18,7 +20,7 @@ use nix::poll::{poll, PollFlags, PollFd};
 use evdev::Key;
 
 extern crate libc;
-use libc::{O_RDONLY, O_RDWR, O_WRONLY};
+use libc::{c_char, c_short, O_RDONLY, O_RDWR, O_WRONLY};
 use subprocess::{Exec, Popen, Redirection};
 
 use futures_util::StreamExt;
@@ -27,7 +29,10 @@ use tokio::runtime::Runtime;
 
 use reqwest::multipart;
 use serde_json::json;
-use tokio::time::Instant;
+
+//use rusty_ffmpeg::ffi;
+use lame_sys::*;
+
 use audio::*;
 
 struct Interface;
@@ -76,6 +81,90 @@ fn u8_to_i16(mut vec: Vec<u8>) -> Vec<i16> {
     return cast;
 }
 
+fn encode_mp3_simple(pcm: &mut [i16]) -> Vec<u8> {
+    let estimate_size = (pcm.len() as f32 * 1.25 + 7200.0) as usize;
+    let mut out = Vec::<u8>::with_capacity(estimate_size);
+    unsafe {
+        out.set_len(estimate_size);
+
+        let ctx = lame_init();
+        lame_set_in_samplerate(ctx, 48000);
+        lame_set_out_samplerate(ctx, 48000);
+        lame_set_VBR(ctx, vbr_default);
+        if lame_init_params(ctx) < 0 {
+            panic!("Failed to init LAME parameters");
+        }
+
+        // worst case estimate according to lame.h
+        let mut mp3_bytes: c_int = 0;
+        let mut bytes_written = 0usize;
+        let mut pcm_processed = 0;
+
+        mp3_bytes = lame_encode_buffer_interleaved(ctx,
+                                                   pcm[pcm_processed * 2..].as_mut_ptr() as *mut c_short,
+                                                   (pcm.len() / 2) as c_int,
+                                                   out.as_mut_ptr() as *mut c_uchar,
+                                                   out.len() as c_int
+        );
+        if mp3_bytes < 0 {
+            panic!("lame encoding failed {mp3_bytes}");
+        }
+        bytes_written += mp3_bytes as usize;
+
+        let mut remaining = &mut out[mp3_bytes as usize..];
+        mp3_bytes = lame_encode_flush(ctx, remaining.as_mut_ptr() as *mut c_uchar, remaining.len() as c_int);
+        if mp3_bytes < 0 {
+            panic!("lame_encode_flush failed {mp3_bytes}");
+        }
+        bytes_written += mp3_bytes as usize;
+        out.set_len(bytes_written);
+        lame_close(ctx);
+        return out;
+    }
+}
+
+fn encode_mp3(pcm: &mut [i16]) -> Vec<u8> {
+    let mut out = Vec::<u8>::new();
+    unsafe {
+        let ctx = lame_init();
+        lame_set_in_samplerate(ctx, 48000);
+        lame_set_out_samplerate(ctx, 48000);
+        lame_set_VBR(ctx, vbr_default);
+        if lame_init_params(ctx) < 0 {
+            panic!("Failed to init LAME parameters");
+        }
+        const SAMPLES_PER_CHUK: usize = 8192;
+        // worst case estimate according to lame.h
+        const MP3_BUF_SIZE: usize = (SAMPLES_PER_CHUK as f32 * 1.25 + 7200.0) as usize;
+        let mut mp3buf: [u8; MP3_BUF_SIZE] = [0; MP3_BUF_SIZE];
+        let mut mp3_bytes: c_int = 0;
+        let mut pcm_processed = 0;
+        loop {
+            let frames_to_process = min(SAMPLES_PER_CHUK, (pcm.len() / 2) - pcm_processed);
+
+            mp3_bytes = lame_encode_buffer_interleaved(ctx,
+                                                      pcm[pcm_processed * 2..].as_mut_ptr() as *mut c_short,
+                                                       frames_to_process as c_int,
+                                                      mp3buf.as_mut_ptr() as *mut c_uchar,
+                                                      mp3buf.len() as c_int
+            );
+            if mp3_bytes < 0 {
+                panic!("lame encoding failed {mp3_bytes}");
+            }
+
+            out.extend_from_slice(&mp3buf[..mp3_bytes as usize]);
+            pcm_processed += frames_to_process;
+            if pcm_processed >= (pcm.len() / 2) {
+                break;
+            }
+        }
+        mp3_bytes = lame_encode_flush(ctx, mp3buf.as_mut_ptr() as *mut c_uchar, mp3buf.len() as c_int);
+        out.extend_from_slice(&mp3buf[..mp3_bytes as usize]);
+        lame_close(ctx);
+        return out;
+    }
+}
+
 async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
     let client = reqwest::Client::new();
     let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream?optimize_streaming_latency=4");
@@ -103,6 +192,16 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: &Sender<Vec<i16>>
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
         *state.lock().unwrap() = State::Playing;
+        /*let ctx;
+        unsafe {
+            ctx = lame_init();
+            lame_set_in_samplerate(ctx, 48000);
+            lame_set_out_samplerate(ctx, 48000);
+            lame_set_decode_only(ctx, 1);
+            if lame_init_params(ctx) < 0 {
+                panic!("Failed to init LAME parameters");
+            }
+        }*/
         let mut convert_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f mp3 -i - -f s16le -ar 48000 -ac 2 -")
             .stdin(Redirection::Pipe)
             .stdout(Redirection::Pipe)
@@ -215,18 +314,13 @@ fn main() {
                         let key = key.clone();
                         *state.lock().unwrap() = State::Recording(pw_sender);
                         thread::spawn(move || {
-                            let mut encode_proc = Exec::shell("ffmpeg -hide_banner -loglevel error -f s16le -ar 48000 -ac 2 -i - -f mp3 -")
-                                .stdin(Redirection::Pipe)
-                                .stdout(Redirection::Pipe)
-                                .popen().unwrap();
-                            let mut stdin = std::mem::take(&mut encode_proc.stdin).unwrap();
-                            thread::spawn(move || {
-                                for pcm in mic_receive.iter() {
-                                    stdin.write_all(unsafe { slice::from_raw_parts(pcm.as_ptr() as *const u8, pcm.len() * 2) }).unwrap();
-                                }
-                            });
-
-                            let mp3 = read_stdout_fully(&encode_proc);
+                            let mut pcm = Vec::<i16>::new();
+                            for v in mic_receive.iter() {
+                                pcm.extend_from_slice(&v);
+                            }
+                            let start = Instant::now();
+                            let mp3 = encode_mp3_simple(pcm.as_mut_slice());
+                            println!("encode took {}ms", start.elapsed().as_millis());
                             *state_copy.lock().unwrap() = State::Generating;
                             let last_copy = RT.block_on(async {
                                 return api(&voice, &key, mp3,output_copy.deref(), &state_copy).await.unwrap();

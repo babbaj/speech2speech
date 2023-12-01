@@ -19,6 +19,8 @@
         pipewire.dev
         libinput.dev
         openssl.dev
+        #ffmpeg.dev
+        lame
       ];
     };
   };
