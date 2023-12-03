@@ -46,7 +46,6 @@ pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_r
         "Speech2Speech",
         properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_ROLE => "Game",
             *pw::keys::MEDIA_CATEGORY => "Playback",
             *pw::keys::TARGET_OBJECT => target
         },
@@ -111,9 +110,9 @@ pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_r
     audio_info.set_rate(SAMPLE_RATE);
     audio_info.set_channels(CHANNELS);
 
-    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),
-            &pw::spa::pod::Value::Object(spa::pod::Object {
+            &spa::pod::Value::Object(spa::pod::Object {
                 type_: spa_sys::SPA_TYPE_OBJECT_Format,
                 id: spa_sys::SPA_PARAM_EnumFormat,
                 properties: audio_info.into(),
@@ -153,7 +152,6 @@ pub fn pw_mic_thread(target: &str, audio_sender: Sender<Vec<i16>>, pw_receiver: 
     let props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "Game",
         *pw::keys::TARGET_OBJECT => target
     };
 

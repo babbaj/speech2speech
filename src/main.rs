@@ -14,6 +14,7 @@ use std::time::Instant;
 use clap::{Arg};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
+use anyhow::{anyhow, Result};
 
 use evdev::Key;
 
@@ -114,7 +115,7 @@ fn mp3_decode_thread(data: Arc<Mutex<Vec<u8>>>, rx: Receiver<bool>, pcm_out: Sen
         mp3dec_init(&mut mp3dec);
         //let mut debug = std::fs::File::create("reee").unwrap();
         let mut offset = 0usize;
-        for finished in rx.iter() {
+        for finished in rx {
             let buf = data.lock().unwrap();
 
             let mut pcm = [0i16; MINIMP3_MAX_SAMPLES_PER_FRAME as usize];
@@ -144,7 +145,7 @@ fn mp3_decode_thread(data: Arc<Mutex<Vec<u8>>>, rx: Receiver<bool>, pcm_out: Sen
 }
 
 
-async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: Sender<Vec<i16>>, state: &Mutex<State>) -> Result<Vec<u8>, reqwest::Error> {
+async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: Sender<Vec<i16>>, state: &Mutex<State>) -> Result<Vec<u8>> {
     let client = reqwest::Client::new();
     let url = format!("https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}/stream?optimize_streaming_latency=4");
 
@@ -171,8 +172,8 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: Sender<Vec<i16>>,
     if response.status().is_success() {
         println!("api took {}ms", start.elapsed().as_millis());
         *state.lock().unwrap() = State::Playing;
-
-        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let len = response.content_length().unwrap_or(0);
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::with_capacity(len as usize)));
         let (decode_tx, decode_rx) = channel();
         let buffer_copy = buffer.clone();
         thread::spawn(move || {
@@ -191,7 +192,7 @@ async fn api(voice_id: &str, api_key: &str, mp3: Vec<u8>, out: Sender<Vec<i16>>,
         return Ok(copy);
     } else {
         let body = response.text().await?;
-        panic!("API failed {body}");
+        return Err(anyhow!("API failed {body}"));
     }
 }
 
@@ -260,17 +261,21 @@ fn main() {
                         *state.lock().unwrap() = State::Recording(pw_sender);
                         thread::spawn(move || {
                             let mut pcm = Vec::<i16>::new();
-                            for v in mic_receive.iter() {
+                            for v in mic_receive {
                                 pcm.extend_from_slice(&v);
                             }
                             let start = Instant::now();
                             let mp3 = encode_mp3(pcm.as_mut_slice());
                             println!("encode took {}ms", start.elapsed().as_millis());
                             *state_copy.lock().unwrap() = State::Generating;
-                            let last_copy = RT.block_on(async {
-                                return api(&voice, &key, mp3,output_copy, &state_copy).await.unwrap();
+                            let response = RT.block_on(async {
+                                return api(&voice, &key, mp3,output_copy, &state_copy).await;
                             });
-                            *state_copy.lock().unwrap() = State::Idle(Some(Arc::new(last_copy)));
+                            if let Err(e) = &response {
+                                println!("{e}");
+                            }
+                            let copy = response.map_or(None, |v| Some(Arc::new(v)));
+                            *state_copy.lock().unwrap() = State::Idle(copy);
                         });
                     }
                     if key_state == KeyState::Released {
