@@ -59,7 +59,7 @@ pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_r
         .process(|stream, state| match stream.dequeue_buffer() {
             None => println!("No buffer received"),
             Some(mut buffer) => {
-                let requested_samples = (get_requested(&buffer) * CHANNELS as u64) as usize;
+                let requested = get_requested(&buffer);
                 let datas = buffer.datas_mut();
                 let stride = CHAN_SIZE * CHANNELS as usize;
                 let data = &mut datas[0];
@@ -67,11 +67,17 @@ pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_r
                 let mut samples_written = 0;
                 if let Some(out_slice) = data.data() {
                     let out_slice_i16 = unsafe { slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut i16, out_slice.len() / 2)};
-                    while samples_written < requested_samples {
+                    let samples = if requested > 0 {
+                        min((requested * CHANNELS as u64) as usize, out_slice_i16.len())
+                    } else {
+                        out_slice_i16.len()
+                    };
+
+                    while samples_written < samples {
                         if let Some((vec, idx)) = &mut state.prev_buffer {
                             let remaining = &vec[*idx..];
 
-                            let len = min(vec.len() - *idx, requested_samples - samples_written);
+                            let len = min(vec.len() - *idx, samples - samples_written);
                             out_slice_i16[samples_written..samples_written + len].copy_from_slice(&remaining[..len]);
                             samples_written += len;
                             *idx += len;
@@ -86,7 +92,7 @@ pub fn pw_playback_thread(target: &str, audio_receiver: Receiver<Vec<i16>>, pw_r
                                 },
                                 Err(TryRecvError::Empty) => {
                                     // fill with silence
-                                    out_slice_i16[samples_written..requested_samples].fill(0);
+                                    out_slice_i16[samples_written..samples].fill(0);
                                     break;
                                 },
                                 Err(TryRecvError::Disconnected) => {
