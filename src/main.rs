@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
 use std::thread;
-use std::ops::{DerefMut};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
@@ -248,37 +248,44 @@ fn main() {
                     }
                 }
                 if event_key == Key::KEY_RIGHTSHIFT {
-                    if key_state == KeyState::Pressed && matches!(*state.lock().unwrap(), State::Idle(_)) {
-                        let (mic_send, mic_receive) = channel();
-                        let (pw_sender, pw_receiver) = pipewire::channel::channel();
-                        let source = source.clone();
-                        thread::spawn(move || pw_mic_thread(&source, mic_send, pw_receiver));
+                    dbg!(event_key);
+                    if key_state == KeyState::Pressed {
+                        let lock = state.lock().unwrap();
+                        if let State::Idle(prev) = lock.deref() {
+                            let prev = prev.clone();
+                            drop(lock);
+                            let (mic_send, mic_receive) = channel();
+                            let (pw_sender, pw_receiver) = pipewire::channel::channel();
+                            let source = source.clone();
+                            thread::spawn(move || pw_mic_thread(&source, mic_send, pw_receiver));
 
-                        let output_copy = audio_sender.clone();
-                        let state_copy = state.clone();
-                        let voice = voice.clone();
-                        let key = key.clone();
-                        *state.lock().unwrap() = State::Recording(pw_sender);
-                        thread::spawn(move || {
-                            let mut pcm = Vec::<i16>::new();
-                            for v in mic_receive {
-                                pcm.extend_from_slice(&v);
-                            }
-                            let start = Instant::now();
-                            let mp3 = encode_mp3(pcm.as_mut_slice());
-                            println!("encode took {}ms", start.elapsed().as_millis());
-                            *state_copy.lock().unwrap() = State::Generating;
-                            let response = RT.block_on(async {
-                                return api(&voice, &key, mp3,output_copy, &state_copy).await;
+                            let output_copy = audio_sender.clone();
+                            let state_copy = state.clone();
+                            let voice = voice.clone();
+                            let key = key.clone();
+                            *state.lock().unwrap() = State::Recording(pw_sender);
+                            thread::spawn(move || {
+                                let mut pcm = Vec::<i16>::new();
+                                for v in mic_receive {
+                                    pcm.extend_from_slice(&v);
+                                }
+                                //let mut debug = std::fs::File::create("reee").unwrap();
+                                //debug.write_all(unsafe {slice::from_raw_parts(pcm.as_ptr() as *const _, pcm.len() * 2) }).unwrap();
+                                let start = Instant::now();
+                                let mp3 = encode_mp3(pcm.as_mut_slice());
+                                println!("encode took {}ms", start.elapsed().as_millis());
+                                *state_copy.lock().unwrap() = State::Generating;
+                                let response = RT.block_on(async {
+                                    return api(&voice, &key, mp3, output_copy, &state_copy).await;
+                                });
+                                if let Err(e) = &response {
+                                    println!("{e}");
+                                }
+                                let new = response.ok().map(Arc::new).or(prev);
+                                *state_copy.lock().unwrap() = State::Idle(new);
                             });
-                            if let Err(e) = &response {
-                                println!("{e}");
-                            }
-                            let copy = response.map_or(None, |v| Some(Arc::new(v)));
-                            *state_copy.lock().unwrap() = State::Idle(copy);
-                        });
-                    }
-                    if key_state == KeyState::Released {
+                        }
+                    } else {
                         if let State::Recording(sender) = state.lock().unwrap().deref_mut() {
                             let _ = sender.send(Terminate);
                         }
